@@ -23,7 +23,10 @@ jobs:
       ANYKERNEL_URL: https://github.com/osm0sis/AnyKernel3
 
     steps:
-      - name: Install dependencies + Clang 17
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
@@ -32,9 +35,7 @@ jobs:
             lz4 python3 unzip wget zip zstd \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
             clang lld llvm
-
           clang --version
-          echo "Clang ready"
 
       - name: Clone kernel source
         run: |
@@ -42,34 +43,35 @@ jobs:
             -b ${{ env.KERNEL_BRANCH }} \
             ${{ env.KERNEL_SOURCE }} \
             kernel
-          echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel" >> $GITHUB_ENV
 
       - name: Integrate KernelSU Next
         run: |
-          cd $GITHUB_WORKSPACE/kernel
+          cd kernel
           curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | \
             bash -s "${{ github.event.inputs.KSU_NEXT_TAG }}"
 
       - name: Apply SUSFS patches
+        env:
+          GIT_CONFIG_NOSYSTEM: "1"
         run: |
-          cd $GITHUB_WORKSPACE
+          git config --global url."https://github.com/".insteadOf "git://github.com/"
           git clone --depth=1 \
             -b ${{ github.event.inputs.SUSFS_BRANCH }} \
-            https://github.com/sidex15/susfs4ksu \
+            https://github.com/sidex15/susfs4ksu.git \
             susfs
 
-          cd $GITHUB_WORKSPACE/kernel
+          cd kernel
 
-          cp ../susfs/kernel_patches/fs/susfs.c           fs/
-          cp ../susfs/kernel_patches/include/linux/susfs.h include/linux/
-          cp ../susfs/kernel_patches/fs/sus_su.c           fs/  || true
+          cp ../susfs/kernel_patches/fs/susfs.c            fs/
+          cp ../susfs/kernel_patches/include/linux/susfs.h  include/linux/
+          cp ../susfs/kernel_patches/fs/sus_su.c            fs/  || true
           cp ../susfs/kernel_patches/include/linux/sus_su.h include/linux/ || true
 
           PATCH_FILE="../susfs/kernel_patches/50_add_susfs_in_gki-${{ github.event.inputs.SUSFS_BRANCH }}.patch"
           if [ -f "$PATCH_FILE" ]; then
             patch -p1 < "$PATCH_FILE" || echo "Patch applied with offsets"
           else
-            echo "Looking for any available patch..."
+            echo "Available patches:"
             ls ../susfs/kernel_patches/*.patch || true
             for p in ../susfs/kernel_patches/*.patch; do
               patch -p1 < "$p" && break || true
@@ -78,10 +80,9 @@ jobs:
 
       - name: Enable SUSFS in defconfig
         run: |
-          cd $GITHUB_WORKSPACE/kernel
+          cd kernel
           DEFCONFIG="arch/arm64/configs/vendor/marble_defconfig"
           cat >> "$DEFCONFIG" << 'EOF'
-
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
           CONFIG_KSU_SUSFS_SUS_MOUNT=y
@@ -96,7 +97,7 @@ jobs:
 
       - name: Build kernel
         run: |
-          cd $GITHUB_WORKSPACE/kernel
+          cd kernel
 
           MAKE_FLAGS="
             O=out
@@ -107,6 +108,61 @@ jobs:
             NM=llvm-nm
             OBJCOPY=llvm-objcopy
             OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            LLVM=1
+            LLVM_IAS=1
+          "
+
+          make $MAKE_FLAGS vendor/marble_defconfig
+          make $MAKE_FLAGS -j$(nproc --all) 2>&1 | tee build.log
+
+          if [ -f "out/arch/arm64/boot/Image" ]; then
+            echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
+          else
+            echo "BUILD_SUCCESS=false" >> $GITHUB_ENV
+            tail -80 build.log
+            exit 1
+          fi
+
+      - name: Package with AnyKernel3
+        if: env.BUILD_SUCCESS == 'true'
+        run: |
+          git clone --depth=1 ${{ env.ANYKERNEL_URL }} AnyKernel3
+          cd AnyKernel3
+          cp kernel/out/arch/arm64/boot/Image .
+          [ -f "kernel/out/arch/arm64/boot/Image.gz-dtb" ] && \
+            cp kernel/out/arch/arm64/boot/Image.gz-dtb . || true
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/' anykernel.sh
+          sed -i 's/device.name1=/device.name1=marble/' anykernel.sh
+          ZIP_NAME="Marble-KSU_Next-SUSFS-$(date +%Y%m%d-%H%M).zip"
+          zip -r9 "../$ZIP_NAME" . -x ".git/*"
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: Upload flashable ZIP
+        if: env.BUILD_SUCCESS == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Marble-KSU_Next-SUSFS
+          path: ${{ env.ZIP_NAME }}
+          retention-days: 7
+
+      - name: Upload raw kernel Image
+        if: env.BUILD_SUCCESS == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-Image
+          path: kernel/out/arch/arm64/boot/Image
+          retention-days: 7
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: kernel/build.log
+          retention-days: 3
             STRIP=llvm-strip
             CROSS_COMPILE=aarch64-linux-gnu-
             CROSS_COMPILE_ARM32=arm-linux-gnueabi-
